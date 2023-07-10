@@ -1092,15 +1092,16 @@ class HistogramObserver(UniformQuantizationObserverBase):
         # Therefore, we avoid such division operation.
         downsample_rate = int(
             torch.ceil(
-                (combined_max - combined_min) * upsample_rate / (self.max_val - self.min_val)
+                ((combined_max - combined_min) / (self.max_val - self.min_val)) * upsample_rate
             ).item()
         )
-        e = downsample_rate * (self.max_val - self.min_val) / upsample_rate - (combined_max - combined_min)
+        e = downsample_rate / upsample_rate * (self.max_val - self.min_val) - (combined_max - combined_min)
         start_idx = int(
-            torch.round((self.min_val - combined_min) * self.bins * upsample_rate / (self.max_val - self.min_val)).item()
+            torch.round((self.min_val - combined_min) / (self.max_val - self.min_val) * self.bins * upsample_rate).item()
         )
         combined_max = combined_max + e
-        combined_min = combined_min
+        assert not torch.isinf(torch.tensor(combined_max - combined_min).sum()), "combined min/max are inf"
+        assert not torch.isinf(torch.tensor(downsample_rate).sum()), "downsample"
         return combined_min, combined_max, downsample_rate, start_idx
 
     def _combine_histograms(
@@ -1143,12 +1144,21 @@ class HistogramObserver(UniformQuantizationObserverBase):
         if x_orig.numel() == 0:
             return x_orig
         x = x_orig.detach()
+        x_min, x_max = torch.aminmax(x)
+        # want to ignore torch.inf since we don't actually
+        # want to make our quantization range infinite
+        # and in practice those values will be clamped
+        if x_min == -torch.inf or x_max == torch.inf:
+            x = x[x.abs() != torch.inf]
+            if x.numel() == 0:
+                return x_orig
+            x_min, x_max = torch.aminmax(x)
         min_val = self.min_val
         max_val = self.max_val
         same_values = min_val.item() == max_val.item()
         is_uninitialized = min_val == float("inf") and max_val == float("-inf")
         if is_uninitialized or same_values:
-            min_val, max_val = torch.aminmax(x)
+            min_val, max_val = x_min ,x_max
             self.min_val.resize_(min_val.shape)
             self.min_val.copy_(min_val)
             self.max_val.resize_(max_val.shape)
@@ -1156,11 +1166,12 @@ class HistogramObserver(UniformQuantizationObserverBase):
             assert (
                 min_val.numel() == 1 and max_val.numel() == 1
             ), "histogram min/max values must be scalar."
+            assert not (torch.isinf(x).sum() or torch.isinf(min_val).sum()  or torch.isinf(max_val).sum()), "first check"
             torch.histc(
                 x, self.bins, min=min_val, max=max_val, out=self.histogram  # type: ignore[arg-type]
             )
         else:
-            new_min, new_max = torch.aminmax(x)
+            new_min, new_max = x_min ,x_max
             combined_min = torch.min(new_min, min_val)
             combined_max = torch.max(new_max, max_val)
             # combine the existing histogram and new histogram into 1 histogram
@@ -1175,6 +1186,7 @@ class HistogramObserver(UniformQuantizationObserverBase):
             assert (
                 combined_min.numel() == 1 and combined_max.numel() == 1
             ), "histogram min/max values must be scalar."
+            assert not (torch.isinf(x).sum() or torch.isinf(combined_min).sum()  or torch.isinf(combined_max).sum()), "second check"
             combined_histogram = torch.histc(
                 x, self.bins, min=combined_min, max=combined_max  # type: ignore[arg-type]
             )
